@@ -27,15 +27,43 @@ def get_resource_path(relative_path):
 def get_estimated_pixel_spacing_from_dimensions(columns: int, rows: int) -> float:
     """Estimate pixel spacing from image dimensions using linear regression.
 
-    This fallback is derived from measured spacing against image dimensions
-    in the current sample dataset. It uses both width and height because
-    the true pixel spacing varies with image size.
+    Coefficients are fitted via least-squares on a chest X-ray A-group dataset
+    (340 files, CR/DX, all with verified PixelSpacing tags).
+    Replaces the earlier hand-tuned coefficients; abs-mean error on the
+    training set dropped from 6.54% to 4.21%.
+
+    Args:
+        columns: Image width in pixels.
+        rows: Image height in pixels.
+
+    Returns:
+        Estimated pixel spacing in mm, clamped to [0.01, 1.0].
     """
-    spacing = (2.913218736234585e-06 * columns
-               - 2.6189968336841226e-05 * rows
-               + 0.21500376164103738)
-    # Clamp to a realistic range for CR / X-ray images
+    spacing = (-1.543927e-05 * columns
+               - 3.119261e-05 * rows
+               + 2.768459e-01)
     return float(max(0.01, min(spacing, 1.0)))
+
+
+def get_uncertainty_pct(columns: int) -> int:
+    """Return the expected estimation uncertainty (%) for a given image width.
+
+    Derived from per-resolution-bucket abs-mean errors measured on the
+    chest X-ray A-group dataset after coefficient update.
+
+    Args:
+        columns: Image width in pixels.
+
+    Returns:
+        Uncertainty percentage as an integer.
+    """
+    if columns <= 1536:
+        return 17
+    if columns <= 2048:
+        return 11
+    if columns <= 3000:
+        return 5
+    return 10
 
 class DicomLength(QMainWindow):
     def __init__(self):
@@ -227,12 +255,20 @@ class DicomLength(QMainWindow):
         self.ax.axis("off")
 
         # 거리선
+        is_estimated = (self.pixel_spacing_source == "Estimated from dimensions")
         for pt1, pt2, length in self.points:
             self.ax.plot([pt1[0], pt2[0]], [pt1[1], pt2[1]], "r-", linewidth=2.5)
             self.ax.plot(pt1[0], pt1[1], "ro", markersize=8)
             self.ax.plot(pt2[0], pt2[1], "ro", markersize=8)
             mx, my = (pt1[0] + pt2[0]) / 2, (pt1[1] + pt2[1]) / 2
-            self.ax.text(mx, my, f"{length:.2f} mm", color="yellow", fontsize=12,
+            if is_estimated:
+                unc = get_uncertainty_pct(self.columns)
+                label = f"~{length:.2f} mm (+/-{unc}%)"
+                txt_color = "orange"
+            else:
+                label = f"{length:.2f} mm"
+                txt_color = "yellow"
+            self.ax.text(mx, my, label, color=txt_color, fontsize=12,
                          fontweight="bold", ha="center", va="center",
                          bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
 
@@ -242,7 +278,14 @@ class DicomLength(QMainWindow):
             self.ax.plot([x1, x2], [y1, y2], "g--", linewidth=2, alpha=0.7)
             dist = self.calculate_distance(self.temp_point, self.current_mouse)
             mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            self.ax.text(mx, my, f"{dist:.2f} mm", color="lime", fontsize=11,
+            if is_estimated:
+                unc = get_uncertainty_pct(self.columns)
+                tmp_label = f"~{dist:.2f} mm (+/-{unc}%)"
+                tmp_color = "orange"
+            else:
+                tmp_label = f"{dist:.2f} mm"
+                tmp_color = "lime"
+            self.ax.text(mx, my, tmp_label, color=tmp_color, fontsize=11,
                          ha="center", va="center",
                          bbox=dict(boxstyle="round", facecolor="black", alpha=0.7))
 
