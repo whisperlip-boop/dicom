@@ -27,26 +27,53 @@ def get_resource_path(relative_path):
 
 
 class IndexingWorker(QThread):
-    """백그라운드에서 DICOM 파일을 인덱싱하는 워커 스레드"""
-    progress = pyqtSignal(int, str)  # progress 값, 메시지
-    finished = pyqtSignal(dict)  # 인덱싱 결과 딕셔너리
-    error = pyqtSignal(str)  # 에러 메시지
+    """백그라운드에서 DICOM 파일을 탐색하고 인덱싱하는 워커 스레드"""
+    # current: 처리 완료 수, total: 전체 수 (0이면 탐색 중 — indeterminate), message: 상태 텍스트
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
 
-    def __init__(self, files, max_workers=4):
+    def __init__(self, search_path: str, recursive: bool, max_workers: int = 4):
+        """
+        Args:
+            search_path: DICOM 파일을 탐색할 루트 경로
+            recursive: 하위 폴더 포함 여부
+            max_workers: 병렬 파일 읽기 스레드 수
+        """
         super().__init__()
-        self.files = files
+        self.search_path = search_path
+        self.recursive = recursive
         self.max_workers = max_workers
 
-    def run(self):
-        dicom_index = defaultdict(list)
-        dicom_tag_values = defaultdict(dict)
-        total_files = len(self.files)
+    def run(self) -> None:
+        """
+        파일 탐색 → 인덱싱 두 단계로 실행.
 
+        탐색 단계에서는 total=0 신호로 indeterminate 진행 바를 표시하고,
+        인덱싱 단계에서는 정확한 진행률을 전달한다.
+        """
         try:
+            # Phase 1: 파일 탐색 — 완료 전까지 개수를 알 수 없으므로 total=0으로 신호
+            self.progress.emit(0, 0, "Scanning for DICOM files...")
+            pattern = os.path.join(
+                self.search_path,
+                "**/*.dcm" if self.recursive else "*.dcm"
+            )
+            files = glob.glob(pattern, recursive=self.recursive)
+            total_files = len(files)
+
+            if total_files == 0:
+                self.finished.emit({'dicom_index': {}, 'dicom_tag_values': {}, 'total_files': 0})
+                return
+
+            # Phase 2: 인덱싱
+            dicom_index = defaultdict(list)
+            dicom_tag_values = defaultdict(dict)
+
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {
                     executor.submit(self._read_dicom_file, file_path): file_path
-                    for file_path in self.files
+                    for file_path in files
                 }
 
                 for idx, future in enumerate(as_completed(futures)):
@@ -60,9 +87,7 @@ class IndexingWorker(QThread):
                     except Exception as e:
                         print(f"읽기 실패 {file_path}: {e}")
 
-                    # 진행상황 신호 발출
-                    progress_pct = int((idx + 1) / total_files * 100)
-                    self.progress.emit(progress_pct, f"{idx + 1}/{total_files} 파일 처리 중...")
+                    self.progress.emit(idx + 1, total_files, f"{idx + 1} / {total_files} files indexed")
 
             self.finished.emit({
                 'dicom_index': dict(dicom_index),
@@ -227,57 +252,77 @@ class DICOMTagSearcher(QMainWindow):
             QMessageBox.warning(self, "경고", "유효한 검색 경로를 입력하세요.")
             return
 
-        pattern = os.path.join(search_path, "**/*.dcm" if self.subdir_cb.isChecked() else "*.dcm")
-        files = glob.glob(pattern, recursive=self.subdir_cb.isChecked())
-
-        if not files:
-            QMessageBox.information(self, "정보", "DICOM 파일을 찾을 수 없습니다.")
-            return
-
         # 이전 워커 종료
         if self.indexing_worker and self.indexing_worker.isRunning():
             self.indexing_worker.quit()
             self.indexing_worker.wait()
 
-        # UI 상태 업데이트
+        # 버튼 비활성화 및 indeterminate 진행 바를 즉시 표시
         self.index_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 0)  # indeterminate 모드
         self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
+        self.result_text.setText("Scanning for DICOM files...")
 
-        # 백그라운드 워커 시작
-        self.indexing_worker = IndexingWorker(files)
+        # 백그라운드 워커 시작 (파일 탐색도 워커 안에서 수행)
+        self.indexing_worker = IndexingWorker(search_path, self.subdir_cb.isChecked())
         self.indexing_worker.progress.connect(self._on_indexing_progress)
         self.indexing_worker.finished.connect(self._on_indexing_finished)
         self.indexing_worker.error.connect(self._on_indexing_error)
         self.indexing_worker.start()
 
-    def _on_indexing_progress(self, value, message):
-        """인덱싱 진행상황 업데이트"""
-        self.progress_bar.setValue(value)
-        self.result_text.setText(f"인덱싱 중...\n{message}")
+    def _on_indexing_progress(self, current: int, total: int, message: str) -> None:
+        """
+        인덱싱 진행상황 업데이트.
 
-    def _on_indexing_finished(self, result):
-        """인덱싱 완료 처리"""
+        Args:
+            current: 처리 완료된 파일 수
+            total: 전체 파일 수 (0이면 탐색 중 — indeterminate 유지)
+            message: 표시할 상태 텍스트
+        """
+        if total == 0:
+            # 탐색 단계: indeterminate 유지 (setRange는 이미 (0,0)으로 설정됨)
+            pass
+        else:
+            # 인덱싱 단계: determinate 모드로 전환하고 진행률 표시
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(current)
+        self.result_text.setText(message)
+
+    def _on_indexing_finished(self, result: dict) -> None:
+        """
+        인덱싱 완료 처리.
+
+        Args:
+            result: 'dicom_index', 'dicom_tag_values', 'total_files' 키를 가진 딕셔너리
+        """
+        # UI 상태 복구 (진행 바를 determinate 초기 상태로 되돌림)
+        self.index_btn.setEnabled(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setVisible(False)
+
+        if result['total_files'] == 0:
+            self.result_text.clear()
+            QMessageBox.information(self, "No Files Found", "No DICOM files were found in the specified path.")
+            return
+
         self.dicom_index = defaultdict(list, result['dicom_index'])
         self.dicom_tag_values = result['dicom_tag_values']
         self.all_dicom_files = list(result['dicom_tag_values'].keys())
 
-        # UI 상태 복구
-        self.index_btn.setEnabled(True)
-        self.progress_bar.setVisible(False)
-
         QMessageBox.information(
-            self, "인덱싱 완료",
-            f"{result['total_files']}개 DICOM 파일 인덱싱 완료!"
+            self, "Indexing Complete",
+            f"{result['total_files']} DICOM files indexed."
         )
 
         # 태그가 있을 때만 자동 검색
         if self.has_valid_tag_condition():
             self.search_and_display()
 
-    def _on_indexing_error(self, error_msg):
+    def _on_indexing_error(self, error_msg: str) -> None:
         """인덱싱 에러 처리"""
         self.index_btn.setEnabled(True)
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setVisible(False)
         QMessageBox.critical(self, "에러", error_msg)
 
