@@ -5,4 +5,3 @@ dist/
 *.pkg
 *.pyc
 __pycache__/
-*.spec
