@@ -7,13 +7,12 @@ import matplotlib
 
 # matplotlib 리소스 포함
 matplotlib_data = collect_data_files('matplotlib')
-colormath_data = collect_data_files('colormath')
 
 a = Analysis(
     ['gsps_viewer.py'],
     pathex=[],
     binaries=[],
-    datas=matplotlib_data + colormath_data,
+    datas=matplotlib_data + [('document-viewer.ico', '.')],
     hiddenimports=[
         'matplotlib.backends.backend_qt5agg',
         'matplotlib.pyplot',
@@ -44,7 +43,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon=['D://github//dicom//gsps//document-viewer.ico'],
+    icon=['D:\\github\\dicom\\gsps\\document-viewer.ico'],
     onefile=True
 )
 
