@@ -14,7 +14,7 @@ from typing import Any
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView
+    QLabel, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QStackedWidget
 )
 from PyQt5.QtGui import QColor, QIcon, QDragEnterEvent, QDropEvent
 from PyQt5.QtCore import Qt
@@ -152,31 +152,43 @@ class TagStatusEvaluator:
     def evaluate_series_uid(cls, value: str) -> tuple[bool, str]:
         """(0020,000E) Series Instance UID 규칙을 검증한다.
 
-        형식: {VUNO_OID}.{VERSION}.{LEVEL}.{SERIES_NUMBER}.{UNIX_TIME}.{RAND_NO}
-        VUNO_OID는 '1.2.410.200123' 고정, VERSION은 정수, LEVEL은 1/2/3,
-        SERIES_NUMBER는 SERIES_MAP 정의값, UNIX_TIME은 양의 정수, RAND_NO는 1~32767.
+        3가지 규칙을 순서대로 시도한다:
+        Rule 1 (VUNO_UID): 1.2.410.200123.{VERSION}.{LEVEL}.{SERIES_NUMBER}.{UNIX_TIME}.{RAND_NO}
+        Rule 2 (Extend Ori): {original_uid}.{series_number} — 원본 ≤50자면 그대로, 초과면 57자 절단
+        Rule 3 (Use Original): 원본 UID 그대로 (원본 없이 검증 불가, OK로 표시)
 
         Args:
             value: 검사할 UID 문자열.
 
         Returns:
-            (ok, status) 튜플. 예시: (True, "OK, series, GSPS").
+            (ok, status) 튜플. 예시: (True, "OK, series, GSPS, VUNO_UID").
         """
         if not value or not isinstance(value, str):
-            return False, "Fail, study, Encap. PDF Report"
+            return False, "Fail"
+
+        # Rule 1: VUNO base UID
         parts = value.split(".")
-        if len(parts) < 9 or parts[:4] != ["1", "2", "410", "200123"]:
-            return False, "Fail, study, Encap. PDF Report"
-        version, level, series_num, unix_time, rand_num = parts[4:9]
-        version_valid = version.isdigit()
-        level_valid = level in ["1", "2", "3"]
-        series_num_valid = series_num in cls.SERIES_MAP
-        unix_time_valid = unix_time.isdigit() and int(unix_time) > 0
-        rand_num_valid = rand_num.isdigit() and 1 <= int(rand_num) <= 32767
-        level_txt = {"1": "study", "2": "series", "3": "instance SOP"}.get(level, "study")
-        series_txt = cls.SERIES_MAP.get(series_num, "Encap. PDF Report")
-        ok = version_valid and level_valid and series_num_valid and unix_time_valid and rand_num_valid
-        return ok, f"{'OK' if ok else 'Fail'}, {level_txt}, {series_txt}"
+        if len(parts) >= 9 and parts[:4] == ["1", "2", "410", "200123"]:
+            version, level, series_num, unix_time, rand_num = parts[4:9]
+            if (version.isdigit() and level in ["1", "2", "3"]
+                    and series_num in cls.SERIES_MAP
+                    and unix_time.isdigit() and int(unix_time) > 0
+                    and rand_num.isdigit() and 1 <= int(rand_num) <= 32767):
+                level_txt = {"1": "study", "2": "series", "3": "instance SOP"}.get(level, level)
+                series_txt = cls.SERIES_MAP.get(series_num, series_num)
+                return True, f"OK, {level_txt}, {series_txt}, VUNO_UID"
+
+        # Rule 2: Extend original UID — ends with .{series_number}
+        for series_num, series_name in cls.SERIES_MAP.items():
+            suffix = f".{series_num}"
+            if value.endswith(suffix):
+                prefix_len = len(value) - len(suffix)
+                if prefix_len <= 50 or prefix_len == 57:
+                    return True, f"OK, {series_name}, Extend Ori"
+                return False, f"Fail, {series_name}, Extend Ori (prefix length {prefix_len})"
+
+        # Rule 3: Use original UID as-is (cannot verify without original)
+        return True, "OK, Use Original"
 
     @classmethod
     def evaluate_sop_instance_uid(cls, value: str) -> tuple[bool, str]:
@@ -313,32 +325,45 @@ class TagStatusEvaluator:
 
     @classmethod
     def evaluate_instance_number(cls, value: str | None) -> tuple[bool, str]:
-        """(0020,0013) Instance Number 끝자리 패턴으로 DICOM 종류를 판별한다.
+        """(0020,0013) Instance Number로 DICOM 종류와 SC Report 페이지를 판별한다.
 
-        끝자리 규칙: 00001=GSPS, 0001=Encap.PDF Report, 001=SC Report,
-        01=SC (ROI), 02=SC (Heatmap), 03=SC (Merge).
+        규칙:
+            SC:               원본 × 100   + 1     → 끝 2자리 "01"
+            SC Report:        원본 × 1000  + page  → 끝 3자리가 페이지 번호(1~N)
+            Encap.PDF Report: 원본 × 10000 + 1     → 끝 4자리 "0001"
+            GSPS:             원본 × 100000 + 1    → 끝 5자리 "00001"
 
         Args:
             value: 검사할 Instance Number 값.
 
         Returns:
-            (ok, dicom_type) 튜플. 예시: (True, "GSPS") / (False, "Fail").
+            (ok, dicom_type) 튜플. 예시: (True, "SC Report (2page)"), (True, "SC").
         """
         if value is None:
             return False, "Fail"
-        suffix = str(value).strip()
-        if suffix.endswith("00001"):
+        s = str(value).strip()
+        if not s or not s.isdigit():
+            return False, "Fail"
+
+        if s.endswith("00001"):
             return True, "GSPS"
-        elif suffix.endswith("0001"):
-            return True, "Encap.PDF Report"
-        elif suffix.endswith("001"):
-            return True, "SC Report"
-        elif suffix.endswith("01"):
-            return True, "SC (ROI)"
-        elif suffix.endswith("02"):
-            return True, "SC (Heatmap)"
-        elif suffix.endswith("03"):
-            return True, "SC (Merge)"
+        if s.endswith("0001"):
+            return True, "Encap. PDF Report"
+
+        # SC Report: 끝 3자리가 페이지 번호
+        # 3자리 전체이고 '0'으로 시작하거나, 4자리 이상이고 4번째 자리가 '0'이 아닌 경우
+        if len(s) >= 3:
+            last3 = s[-3:]
+            if last3.isdigit():
+                page = int(last3)
+                is_short_zero = (len(s) == 3 and s[0] == '0')
+                is_long_nonzero = (len(s) >= 4 and s[-4] != '0')
+                if (is_short_zero or is_long_nonzero) and 1 <= page <= 999:
+                    return True, f"SC Report ({page}page)"
+
+        if s.endswith("01"):
+            return True, "SC"
+
         return False, "Fail"
 
     @classmethod
@@ -436,6 +461,31 @@ class TagStatusEvaluator:
             return True, "OK"
         return False, "Fail"
 
+    @classmethod
+    def evaluate_same_as_original(
+        cls, result_val: str, original_ds: "pydicom.Dataset | None", tag: BaseTag
+    ) -> tuple[bool, str]:
+        """결과 파일의 태그 값이 원본과 동일한지 검증한다.
+
+        원본에 태그 또는 값이 없으면 결과도 없어야 한다.
+
+        Args:
+            result_val: 결과 파일의 태그 값.
+            original_ds: 원본 DICOM Dataset. None이면 원본 미로딩.
+            tag: 비교 대상 태그.
+
+        Returns:
+            (ok, status) 튜플.
+        """
+        if original_ds is None:
+            return False, "No original"
+        orig_val = str(original_ds[tag].value).strip() if tag in original_ds else ""
+        if result_val == orig_val:
+            return True, "OK"
+        if not orig_val:
+            return False, "Fail (should be empty)"
+        return False, f"Fail (original: {orig_val})"
+
 
 class TagCheckerApp(QMainWindow):
     """VUNO DICOM 결과 태그 검증 GUI 애플리케이션.
@@ -448,7 +498,7 @@ class TagCheckerApp(QMainWindow):
     def __init__(self) -> None:
         """메인 윈도우 레이아웃과 위젯을 초기화한다."""
         super().__init__()
-        self.setGeometry(100, 100, 1520, 1100)
+        self.setGeometry(100, 100, 1490, 1150)
         self.setAcceptDrops(True)
 
         self.central = QWidget()
@@ -467,12 +517,25 @@ class TagCheckerApp(QMainWindow):
 
         self.main_layout.addLayout(hbox)
 
+        self.placeholder_label = QLabel("Original loaded")
+        self.placeholder_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)  # type: ignore[operator]
+        self.placeholder_label.setStyleSheet("font-size: 36px; color: #555555; background-color: white;")
+
         self.table = QTableWidget()
-        self.main_layout.addWidget(self.table)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.placeholder_label)  # index 0: original-only state
+        self.stack.addWidget(self.table)              # index 1: result loaded
+        self.stack.setCurrentIndex(1)
+        self.main_layout.addWidget(self.stack)
 
         self.load_button.clicked.connect(self.load_dicom)
         self.export_button.clicked.connect(self.export_csv)
         self.tags: list[dict[str, Any]] = []
+        self.original_ds: pydicom.Dataset | None = None
+        self.result_ds: pydicom.Dataset | None = None
+        self.original_path: str = ""
+        self.result_path: str = ""
         self.setWindowTitle("Tag Checker - No file loaded")
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -504,32 +567,105 @@ class TagCheckerApp(QMainWindow):
         if path:
             self.load_dicom_from_path(path)
 
+    @staticmethod
+    def _get_tag_str(ds: pydicom.Dataset, tag: BaseTag) -> str:
+        """Dataset에서 태그 값을 문자열로 반환한다. 태그가 없으면 빈 문자열."""
+        if tag in ds:
+            return str(ds[tag].value).strip()
+        return ""
+
+    def _is_result_file(self, ds: pydicom.Dataset) -> bool:
+        """(0008,0070) Manufacturer가 'VUNO'이면 결과 파일로 판별한다."""
+        return self._get_tag_str(ds, Tag(0x0008, 0x0070)) == "VUNO"
+
+    def _verify_pair(self) -> bool:
+        """원본과 결과 파일이 같은 Study에 속하는지 검증한다.
+
+        (0020,000D) Study Instance UID → (0010,0020) Patient ID 순으로 시도한다.
+        두 값 모두 없으면 False를 반환한다.
+
+        Returns:
+            두 파일의 페어 키가 일치하면 True, 그 외 False.
+        """
+        if self.original_ds is None or self.result_ds is None:
+            return False
+        for tag in (Tag(0x0020, 0x000D), Tag(0x0010, 0x0020)):
+            orig = self._get_tag_str(self.original_ds, tag)
+            result = self._get_tag_str(self.result_ds, tag)
+            if orig and result:
+                return orig == result
+        return False
+
+    def _update_labels(self) -> None:
+        """현재 로딩 상태에 따라 file_label과 윈도우 타이틀을 갱신한다."""
+        orig_name = os.path.basename(self.original_path) if self.original_path else ""
+        result_name = os.path.basename(self.result_path) if self.result_path else ""
+
+        if orig_name and result_name:
+            suffix = "" if self._verify_pair() else " (mismatch)"
+            label = f"Original: {orig_name}{suffix} | Result: {result_name}"
+            title = f"Tag Checker - {result_name}"
+            self.stack.setCurrentIndex(1)
+        elif result_name:
+            label = f"Result: {result_name} | No original"
+            title = f"Tag Checker - {result_name}"
+            self.stack.setCurrentIndex(1)
+        elif orig_name:
+            label = f"Original: {orig_name} | No result"
+            title = f"Tag Checker - {orig_name}"
+            self.stack.setCurrentIndex(0)
+        else:
+            label = "No file loaded"
+            title = "Tag Checker - No file loaded"
+            self.stack.setCurrentIndex(1)
+
+        self.file_label.setText(label)
+        self.setWindowTitle(title)
+
     def load_dicom_from_path(self, path: str) -> None:
         """지정된 경로의 DICOM 파일을 읽고 태그를 추출하여 테이블을 갱신한다.
+
+        (0008,0070)=="VUNO" 여부로 결과/원본을 판별하여 상태를 갱신한다.
+        두 파일이 모두 로딩되면 Study UID(또는 Patient ID)로 페어를 검증하고,
+        일치하는 경우에만 원본 비교 검증((0008,0090), (0020,0010))을 수행한다.
 
         Args:
             path: 로드할 DICOM 파일의 절대 경로.
         """
-        filename = os.path.basename(path)
-        self.file_label.setText(filename)
-        self.setWindowTitle(f"Tag Checker - {filename}")
         try:
             ds = pydicom.dcmread(path, force=True)
-            self.tags = self.extract_tags(ds)
-            self.populate_table()
         except Exception as e:
-            self.file_label.setText(f"Error loading DICOM: {str(e)}")
-            self.tags = []
-            self.populate_table()
+            self.file_label.setText(f"Error loading DICOM: {e}")
+            return
 
-    def extract_tags(self, ds: pydicom.Dataset) -> list[dict[str, Any]]:
+        if self._is_result_file(ds):
+            self.result_ds = ds
+            self.result_path = path
+        else:
+            self.original_ds = ds
+            self.original_path = path
+
+        if self.result_ds is not None:
+            paired = self._verify_pair() if self.original_ds is not None else False
+            self.tags = self.extract_tags(self.result_ds, self.original_ds if paired else None)
+        else:
+            self.tags = []
+
+        self._update_labels()
+        self.populate_table()
+
+    def extract_tags(
+        self, ds: pydicom.Dataset, original_ds: pydicom.Dataset | None = None
+    ) -> list[dict[str, Any]]:
         """Dataset에서 검증 대상 태그를 추출하고 규칙 준수 여부를 평가한다.
 
         일반 태그와 Private Tag를 순서대로 처리하며,
         동일 태그 ID에 복수 값이 있으면 각각 별도 행으로 추가한다.
+        original_ds가 제공되면 원본 비교가 필요한 태그((0008,0090), (0020,0010))도 검증한다.
 
         Args:
             ds: 로드된 pydicom Dataset 객체.
+            original_ds: 원본 DICOM Dataset. None이면 원본 비교 검증 불가.
 
         Returns:
             각 태그 정보를 담은 딕셔너리 리스트.
@@ -552,6 +688,17 @@ class TagCheckerApp(QMainWindow):
         conv_val = str(ds[conv_tag].value).strip() if conv_tag in ds else ""
         ok, status = TagStatusEvaluator.evaluate_conversion_type(conv_val, series_num_str)
         add(conv_tag, "Conversion Type", conv_val, ok, status)
+
+        for tag, desc in [
+            (Tag(0x0008, 0x0090), "Referring Physician Name"),
+            (Tag(0x0020, 0x0010), "Study ID"),
+        ]:
+            try:
+                val = str(ds[tag].value).strip() if tag in ds else ""
+                ok, status = TagStatusEvaluator.evaluate_same_as_original(val, original_ds, tag)
+                add(tag, desc, val, ok, status)
+            except Exception:
+                add(tag, desc, "ERROR", False, "Fail")
 
         tag_map = [
             (Tag(0x0020, 0x000E), "Series Instance UID", TagStatusEvaluator.evaluate_series_uid),
@@ -621,7 +768,7 @@ class TagCheckerApp(QMainWindow):
         self.table.setColumnWidth(0, 60)
         self.table.setColumnWidth(1, 60)
         self.table.setColumnWidth(2, 300)
-        self.table.setColumnWidth(3, 800)
+        self.table.setColumnWidth(3, 710)
         self.table.setColumnWidth(4, 300)
 
         for row, tag in enumerate(sorted(self.tags, key=lambda x: (int(x["group"], 16), int(x["element"], 16)))):
