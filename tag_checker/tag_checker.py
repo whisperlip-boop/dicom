@@ -9,7 +9,6 @@ import csv
 import json
 import re
 import datetime
-import ctypes
 from typing import Any
 
 from PyQt5.QtWidgets import (
@@ -802,10 +801,11 @@ class TagCheckerApp(QMainWindow):
 
 
 if __name__ == "__main__":
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("vuno.tag_checker")
     extend_dicom_dictionary()
     app = QApplication(sys.argv)
+    icon_path = get_resource_path("checker.ico")
+    app.setWindowIcon(QIcon(icon_path))
     window = TagCheckerApp()
-    app.setWindowIcon(QIcon(get_resource_path("checker.ico")))
+    window.setWindowIcon(QIcon(icon_path))
     window.show()
     sys.exit(app.exec_())
