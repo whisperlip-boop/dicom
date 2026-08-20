@@ -1,5 +1,8 @@
 import os
 import sys
+from typing import List, Optional, Tuple, cast
+
+import numpy as np
 import pydicom
 from PyQt5.QtWidgets import (
     QApplication,
@@ -18,31 +21,33 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSpacerItem,
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QIntValidator
-from PyQt5.QtGui import QColor
-from PyQt5.QtGui import QIcon
-import numpy as np
+from PyQt5.QtCore import QMimeData, Qt
+from PyQt5.QtGui import (
+    QClipboard,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QIntValidator,
+)
+from pydicom.dataelem import DataElement
+from pydicom.dataset import FileDataset
 from pydicom.misc import is_dicom
 
-def get_resource_path(filename):
+
+def get_resource_path(filename: str) -> str:
     """Return the absolute path to a resource, supporting PyInstaller bundles."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, filename)
     return os.path.join(os.path.dirname(__file__), filename)
 
 class DicomTagLoader(QWidget):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
+        self.pixel_data_value: Optional[np.ndarray] = None
         self.initUI()
-        self.pixel_data_value = None
-        self.current_filters = {
-            "group": "",
-            "element": "",
-            "description": "",
-        }
 
-    def initUI(self):
+    def initUI(self) -> None:
         self.setWindowTitle("DICOM Tag Loader")
         self.setGeometry(100, 100, 1200, 900)
         self.setAcceptDrops(True)
@@ -62,27 +67,16 @@ class DicomTagLoader(QWidget):
         # 검색 및 버튼 Layout 설정
         function_layout = QHBoxLayout()
 
-        self.group_input = QLineEdit()
-        self.group_input.setPlaceholderText("Group")
-        self.group_input.setFixedWidth(60)
-        self.group_input.setValidator(QIntValidator(0, 9999))
-
-        self.element_input = QLineEdit()
-        self.element_input.setPlaceholderText("Element")
-        self.element_input.setFixedWidth(60)
-        self.element_input.setValidator(QIntValidator(0, 9999))
-
-        self.description_input = QLineEdit()
-        self.description_input.setPlaceholderText("Description")
-        self.description_input.setFixedWidth(200)
+        # Group/Element/Description 세트를 2개 배치: 세트 내부는 AND, 세트 간은 OR로 결합
+        self.filter_groups: List[Tuple[QLineEdit, QLineEdit, QLineEdit]] = [
+            self._create_filter_inputs(function_layout)
+        ]
+        function_layout.addWidget(QLabel("OR"))
+        self.filter_groups.append(self._create_filter_inputs(function_layout))
 
         self.clear_button = QPushButton("X")
         self.clear_button.setFixedWidth(20)
         self.clear_button.clicked.connect(self.clearSearchFields)
-
-        function_layout.addWidget(self.group_input)
-        function_layout.addWidget(self.element_input)
-        function_layout.addWidget(self.description_input)
         function_layout.addWidget(self.clear_button)
         function_layout.addStretch()
 
@@ -97,7 +91,7 @@ class DicomTagLoader(QWidget):
 
         self.copy_all_button.clicked.connect(self.copyAll)
         self.copy_value_button.clicked.connect(
-            lambda: self.copyValue(self.tabs.currentWidget())
+            lambda: self.copyValue(self._current_table())
         )
 
         function_layout.addStretch()
@@ -111,68 +105,92 @@ class DicomTagLoader(QWidget):
 
         self.initEmptyTabs()
 
-        self.group_input.textChanged.connect(self.filterTable)
-        self.element_input.textChanged.connect(self.filterTable)
-        self.description_input.textChanged.connect(self.filterTable)
+    def _create_filter_inputs(
+        self, row_layout: QHBoxLayout
+    ) -> Tuple[QLineEdit, QLineEdit, QLineEdit]:
+        """Group/Element/Description 입력 세트 하나를 만들어 row_layout에 배치한다."""
+        group_input = QLineEdit()
+        group_input.setPlaceholderText("Group")
+        group_input.setFixedWidth(60)
+        group_input.setValidator(QIntValidator(0, 9999))
 
-    def initEmptyTabs(self):
+        element_input = QLineEdit()
+        element_input.setPlaceholderText("Element")
+        element_input.setFixedWidth(60)
+        element_input.setValidator(QIntValidator(0, 9999))
+
+        description_input = QLineEdit()
+        description_input.setPlaceholderText("Description")
+        description_input.setFixedWidth(200)
+
+        row_layout.addWidget(group_input)
+        row_layout.addWidget(element_input)
+        row_layout.addWidget(description_input)
+
+        group_input.textChanged.connect(self.filterTable)
+        element_input.textChanged.connect(self.filterTable)
+        description_input.textChanged.connect(self.filterTable)
+
+        return group_input, element_input, description_input
+
+    def initEmptyTabs(self) -> None:
         self.addTab(None, "All")
         self.addTab(None, "Patient")
         self.addTab(None, "Study/Series")
         self.addTab(None, "Image")
 
-    def openFile(self, filepath=None):
+    def openFile(self, filepath: Optional[str] = None) -> None:
         if not filepath:
             file_dialog = QFileDialog.getOpenFileName(
                 self, "Open DICOM File", "", "DICOM Files (*.dcm)"
             )
             filepath = file_dialog[0]
-        if filepath:
-            self.file_path.setText(filepath)
-            try:
-                if not is_dicom(filepath):
-                    QMessageBox.critical(
-                        self, "Error", "The selected file is not a valid DICOM file."
-                    )
-                    return
-                dicom_data = pydicom.dcmread(filepath, force=True)
+        if not filepath:
+            return
 
-                # 현재 선택된 탭 인덱스 저장
-                current_tab_index = self.tabs.currentIndex()
-                current_tab_name = self.tabs.tabText(current_tab_index) if current_tab_index >= 0 else "All"
+        self.file_path.setText(filepath)
+        try:
+            if not is_dicom(filepath):
+                QMessageBox.critical(
+                    self, "Error", "The selected file is not a valid DICOM file."
+                )
+                return
+            dicom_data = pydicom.dcmread(filepath, force=True)
 
-                # 탭 유지 및 내용 갱신
-                self.tabs.clear()
-                self.pixel_data_value = None
-                self.addTab(dicom_data, "All")
-                self.addTab(dicom_data, "Patient")
-                self.addTab(dicom_data, "Study/Series")
-                self.addTab(dicom_data, "Image")
+            # 현재 선택된 탭 인덱스 저장
+            current_tab_index = self.tabs.currentIndex()
+            current_tab_name = self.tabs.tabText(current_tab_index) if current_tab_index >= 0 else "All"
 
-                # 이전 탭으로 복원
-                for i in range(self.tabs.count()):
-                    if self.tabs.tabText(i) == current_tab_name:
-                        self.tabs.setCurrentIndex(i)
-                        break
-                else:
-                    self.tabs.setCurrentIndex(0)  # 탭 이름이 없으면 All 탭으로
+            # 탭 유지 및 내용 갱신
+            self.tabs.clear()
+            self.pixel_data_value = None
+            self.addTab(dicom_data, "All")
+            self.addTab(dicom_data, "Patient")
+            self.addTab(dicom_data, "Study/Series")
+            self.addTab(dicom_data, "Image")
 
-                # 기존 검색 필터 복원
-                self.restoreFilters()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Error reading DICOM file: {e}")
-            return dicom_data
+            # 이전 탭으로 복원
+            for i in range(self.tabs.count()):
+                if self.tabs.tabText(i) == current_tab_name:
+                    self.tabs.setCurrentIndex(i)
+                    break
+            else:
+                self.tabs.setCurrentIndex(0)  # 탭 이름이 없으면 All 탭으로
 
-    def addTab(self, dicom_data, tag_type):
+            # 새로 만들어진 탭에도 기존 검색 필터를 재적용
+            self.filterTable()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error reading DICOM file: {e}")
+
+    def addTab(self, dicom_data: Optional[FileDataset], tag_type: str) -> None:
         table = QTableWidget()
-        elements = []
+        elements: List[DataElement] = []
 
-        if tag_type == "All":
-            if hasattr(dicom_data, "file_meta"):
-                for element in dicom_data.file_meta:
-                    elements.append(element)
+        if tag_type == "All" and dicom_data is not None and hasattr(dicom_data, "file_meta"):
+            for element in dicom_data.file_meta:
+                elements.append(element)
 
-        if dicom_data:
+        if dicom_data is not None:
             seen_tags = set()
 
             for element in dicom_data.iterall():
@@ -224,8 +242,9 @@ class DicomTagLoader(QWidget):
         table.setColumnWidth(2, 230)
         table.setColumnWidth(3, 25)
         table.setColumnWidth(4, 30)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        table.horizontalHeader().setStretchLastSection(True)
+        header = cast(QHeaderView, table.horizontalHeader())
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
 
         for row, element in enumerate(elements):
             table.setItem(row, 0, QTableWidgetItem(f"{element.tag.group:04X}"))
@@ -234,7 +253,7 @@ class DicomTagLoader(QWidget):
             table.setItem(row, 3, QTableWidgetItem(element.VR))
             size = len(str(element.value)) if element.value else 0
             table.setItem(row, 4, QTableWidgetItem(str(size)))
-            if element.tag.group == 0x0010 and element.tag.element == 0x0010:
+            if dicom_data is not None and element.tag.group == 0x0010 and element.tag.element == 0x0010:
                 table.setItem(row, 5, QTableWidgetItem(str(dicom_data.PatientName)))
             elif element.tag.group == 0x7FE0 and element.tag.element == 0x0010:
                 table.setItem(row, 5, QTableWidgetItem("Encoded graphical image data"))
@@ -249,15 +268,17 @@ class DicomTagLoader(QWidget):
 
         self.tabs.addTab(table, tag_type)
 
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        mime_data = cast(QMimeData, event.mimeData())
+        if mime_data.hasUrls():
             event.accept()
         else:
             event.ignore()
 
-    def dropEvent(self, event):
-        if event.mimeData().hasUrls():
-            file_url = event.mimeData().urls()[0]
+    def dropEvent(self, event: QDropEvent) -> None:
+        mime_data = cast(QMimeData, event.mimeData())
+        if mime_data.hasUrls():
+            file_url = mime_data.urls()[0]
             filepath = file_url.toLocalFile()
             try:
                 if not is_dicom(filepath):
@@ -275,95 +296,120 @@ class DicomTagLoader(QWidget):
                 self, "Error", "The dropped content is not a valid file."
             )
 
-    def _get_row_data(self, table, selected_row, columns=None):
+    def _current_table(self) -> QTableWidget:
+        """탭에는 항상 addTab()에서 만든 QTableWidget만 들어있음을 전제로 반환한다."""
+        return cast(QTableWidget, self.tabs.currentWidget())
+
+    def _get_row_data(
+        self, table: QTableWidget, selected_row: int, columns: Optional[int] = None
+    ) -> List[str]:
         """
         행 데이터를 가져옴
         columns=None: 모든 열 복사
         columns=정수: 해당 열만 복사
         """
-        row_data = []
+        row_data: List[str] = []
 
         if columns is None:
             cols_to_copy = range(table.columnCount())
         else:
             cols_to_copy = [columns]
 
+        group_item = table.item(selected_row, 0)
+        element_item = table.item(selected_row, 1)
+        is_pixel_data = (
+            group_item is not None
+            and element_item is not None
+            and group_item.text().strip().upper() == "7FE0"
+            and element_item.text().strip().upper() == "0010"
+        )
+
         for col in cols_to_copy:
             item = table.item(selected_row, col)
             if item:
                 # PixelData (0x7FE0, 0x0010) 특수처리
-                if (col == 5 and
-                    table.item(selected_row, 0).text().strip().upper() == "7FE0" and
-                    table.item(selected_row, 1).text().strip().upper() == "0010"):
+                if col == 5 and is_pixel_data and self.pixel_data_value is not None:
                     row_data.append(np.array2string(self.pixel_data_value))
                 else:
                     row_data.append(item.text())
 
         return row_data
 
-    def copyValue(self, table):
+    def copyValue(self, table: QTableWidget) -> None:
         """선택된 행의 Value 열(column 5)만 복사"""
         selected_row = table.currentRow()
         if selected_row >= 0:
             row_data = self._get_row_data(table, selected_row, columns=5)
-            QApplication.clipboard().setText("\t".join(row_data))
+            clipboard = cast(QClipboard, QApplication.clipboard())
+            clipboard.setText("\t".join(row_data))
         else:
             print("No row selected.")
 
-    def copyAll(self):
+    def copyAll(self) -> None:
         """선택된 행의 모든 열 복사"""
-        table = self.tabs.currentWidget()
+        table = self._current_table()
         selected_row = table.currentRow()
         if selected_row >= 0:
             row_data = self._get_row_data(table, selected_row)  # columns=None
-            QApplication.clipboard().setText("\t".join(row_data))
+            clipboard = cast(QClipboard, QApplication.clipboard())
+            clipboard.setText("\t".join(row_data))
         else:
             print("No row selected.")
 
-    def filterTable(self):
-        self.current_filters["group"] = self.group_input.text().strip()
-        self.current_filters["element"] = self.element_input.text().strip()
-        self.current_filters["description"] = self.description_input.text().strip().lower()
+    @staticmethod
+    def _matches_condition(
+        group_item: Optional[QTableWidgetItem],
+        element_item: Optional[QTableWidgetItem],
+        description_item: Optional[QTableWidgetItem],
+        group_id: str,
+        element_id: str,
+        description_txt: str,
+    ) -> bool:
+        """세트 하나(Group/Element/Description)의 AND 조건을 만족하는지 확인."""
+        group_match = not group_id or (
+            group_item is not None and group_item.text().startswith(group_id)
+        )
+        element_match = not element_id or (
+            element_item is not None and element_item.text().startswith(element_id)
+        )
+        description_match = not description_txt or (
+            description_item is not None
+            and description_txt in description_item.text().lower()
+        )
+        return group_match and element_match and description_match
 
-        group_id = self.current_filters["group"]
-        element_id = self.current_filters["element"]
-        description_txt = self.current_filters["description"]
+    def filterTable(self) -> None:
+        conditions = [
+            (
+                group_input.text().strip(),
+                element_input.text().strip(),
+                description_input.text().strip().lower(),
+            )
+            for group_input, element_input, description_input in self.filter_groups
+        ]
+        # 값이 하나도 입력되지 않은 세트는 OR 조건에서 제외한다.
+        # (모든 세트가 비어 있을 때만 전체 표시로 취급)
+        active_conditions = [c for c in conditions if any(c)]
 
         for i in range(self.tabs.count()):
-            table = self.tabs.widget(i)
+            table = cast(QTableWidget, self.tabs.widget(i))
             for row in range(table.rowCount()):
-                group_match = (
-                    True
-                    if not group_id
-                    else table.item(row, 0)
-                    and table.item(row, 0).text().startswith(group_id)
+                group_item = table.item(row, 0)
+                element_item = table.item(row, 1)
+                description_item = table.item(row, 2)
+                matches = not active_conditions or any(
+                    self._matches_condition(
+                        group_item, element_item, description_item, *condition
+                    )
+                    for condition in active_conditions
                 )
-                element_match = (
-                    True
-                    if not element_id
-                    else table.item(row, 1)
-                    and table.item(row, 1).text().startswith(element_id)
-                )
-                description_match = (
-                    True
-                    if not description_txt
-                    else table.item(row, 2)
-                    and description_txt in table.item(row, 2).text().lower()
-                )
-                table.setRowHidden(
-                    row, not (group_match and element_match and description_match)
-                )
+                table.setRowHidden(row, not matches)
 
-    def restoreFilters(self):
-        self.group_input.setText(self.current_filters["group"])
-        self.element_input.setText(self.current_filters["element"])
-        self.description_input.setText(self.current_filters["description"])
-        self.filterTable()
-
-    def clearSearchFields(self):
-        self.group_input.clear()
-        self.element_input.clear()
-        self.description_input.clear()
+    def clearSearchFields(self) -> None:
+        for group_input, element_input, description_input in self.filter_groups:
+            group_input.clear()
+            element_input.clear()
+            description_input.clear()
         self.filterTable()
 
 if __name__ == "__main__":
