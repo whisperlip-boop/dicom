@@ -147,23 +147,46 @@ class TagStatusEvaluator:
         "VN-M-06": "DB", "VN-M-07": "DB AD", "VN-M-30": "CXR Triage", "VN-M-31": "CXR Assist"
     }
 
+    # (1001,1011)이 적용되는 CXR 제품군. Triage(VN-M-30)는 스펙 예시에 없어 있으면 검증, 없으면 Skip.
+    CXR_FAMILY: set[str] = {"VN-M-02", "VN-M-30", "VN-M-31"}
+    PRIVATE_1011_REQUIRED: set[str] = {"VN-M-02", "VN-M-31"}
+    PRIVATE_1011_SERIES: set[str] = {"900010", "900090"}
+
+    # (0008,0064) Conversion Type "WSD"가 필수인 Series Number
+    CONVERSION_TYPE_SERIES: set[str] = {"900010", "900070"}
+
+    # (0020,0013) Instance Number = 원본 × multiplier + offset(lo~hi). 900071~73은 SC Report 변형으로 취급.
+    INSTANCE_RULES: dict[str, tuple[int, int, int]] = {
+        "900010": (100, 1, 1),
+        "900070": (1000, 1, 6), "900071": (1000, 1, 6), "900072": (1000, 1, 6), "900073": (1000, 1, 6),
+        "900080": (10000, 1, 1),
+        "900090": (100000, 1, 1),
+    }
+
     @classmethod
-    def evaluate_series_uid(cls, value: str) -> tuple[bool, str]:
-        """(0020,000E) Series Instance UID 규칙을 검증한다.
+    def evaluate_series_uid(cls, value: str, original_uid: str = "") -> tuple[bool, str]:
+        """(0020,000E) Series Instance UID 규칙을 검증하고 어떤 형태인지 판별한다.
 
         3가지 규칙을 순서대로 시도한다:
         Rule 1 (VUNO_UID): 1.2.410.200123.{VERSION}.{LEVEL}.{SERIES_NUMBER}.{UNIX_TIME}.{RAND_NO}
         Rule 2 (Extend Ori): {original_uid}.{series_number} — 원본 ≤50자면 그대로, 초과면 57자 절단
-        Rule 3 (Use Original): 원본 UID 그대로 (원본 없이 검증 불가, OK로 표시)
+        Rule 3 (Use Original): 원본 UID 그대로
+
+        original_uid가 주어지면 Rule 2·3을 원본 값과 실제 비교하고,
+        없으면 형식만으로 추정한다(Rule 3은 검증 불가이므로 OK 처리).
 
         Args:
             value: 검사할 UID 문자열.
+            original_uid: 페어링된 원본의 Series Instance UID. 없으면 빈 문자열.
 
         Returns:
             (ok, status) 튜플. 예시: (True, "OK, series, GSPS, VUNO_UID").
         """
         if not value or not isinstance(value, str):
             return False, "Fail"
+
+        if original_uid:
+            return cls._evaluate_series_uid_with_original(value, original_uid)
 
         # Rule 1: VUNO base UID
         parts = value.split(".")
@@ -178,16 +201,38 @@ class TagStatusEvaluator:
                 return True, f"OK, {level_txt}, {series_txt}, VUNO_UID"
 
         # Rule 2: Extend original UID — ends with .{series_number}
+        # 원본이 51~56자면 57자 절단 없이 그대로 쓰이므로 prefix 길이는 최대 57
         for series_num, series_name in cls.SERIES_MAP.items():
             suffix = f".{series_num}"
             if value.endswith(suffix):
                 prefix_len = len(value) - len(suffix)
-                if prefix_len <= 50 or prefix_len == 57:
+                if prefix_len <= 57:
                     return True, f"OK, {series_name}, Extend Ori"
                 return False, f"Fail, {series_name}, Extend Ori (prefix length {prefix_len})"
 
         # Rule 3: Use original UID as-is (cannot verify without original)
-        return True, "OK, Use Original"
+        return True, "OK, Use Original (unverified)"
+
+    @classmethod
+    def _evaluate_series_uid_with_original(cls, value: str, original_uid: str) -> tuple[bool, str]:
+        """원본 Series UID가 있을 때 Rule 1~3 중 어느 형태인지 판별하고 값을 대조한다."""
+        vuno_ok, vuno_status = cls.evaluate_series_uid(value)
+        if vuno_status.endswith("VUNO_UID"):
+            return vuno_ok, vuno_status
+
+        # Rule 3: 원본과 완전히 동일
+        if value == original_uid:
+            return True, "OK, Use Original"
+
+        # Rule 2: {원본 또는 57자 절단}.{series_number}
+        base = original_uid if len(original_uid) <= 50 else original_uid[:57]
+        for series_num, series_name in cls.SERIES_MAP.items():
+            if value == f"{base}.{series_num}":
+                return True, f"OK, {series_name}, Extend Ori"
+            if value.endswith(f".{series_num}"):
+                return False, f"Fail, {series_name}, Extend Ori (prefix != original)"
+
+        return False, "Fail, not VUNO_UID / Extend Ori / Use Original"
 
     @classmethod
     def evaluate_sop_instance_uid(cls, value: str) -> tuple[bool, str]:
@@ -203,20 +248,29 @@ class TagStatusEvaluator:
             (ok, status) 튜플. 예시: (True, "OK, series, GSPS").
         """
         if not value or not isinstance(value, str):
-            return False, "Fail, study, Encap. PDF Report"
+            return False, "Fail (empty)"
         parts = value.split(".")
-        if len(parts) >= 10 and parts[:5] == ["1", "2", "410", "200123", "100"]:
-            level, series_num, unix_time, rand_num, instance_num = parts[5:10]
-            level_valid = level in ["1", "2", "3"]
-            series_num_valid = series_num in cls.SERIES_MAP
-            unix_time_valid = unix_time.isdigit() and int(unix_time) > 0
-            rand_num_valid = rand_num.isdigit() and 1 <= int(rand_num) <= 32767
-            instance_valid = instance_num.isdigit()
-            level_txt = {"1": "study", "2": "series", "3": "instance SOP"}.get(level, "study")
-            series_txt = cls.SERIES_MAP.get(series_num, "Encap. PDF Report")
-            ok = level_valid and series_num_valid and unix_time_valid and rand_num_valid and instance_valid
-            return ok, f"{'OK' if ok else 'Fail'}, {level_txt}, {series_txt}"
-        return False, "Fail, study, Encap. PDF Report"
+        if len(parts) < 10:
+            return False, f"Fail (expected 10 components, got {len(parts)})"
+        if parts[:5] != ["1", "2", "410", "200123", "100"]:
+            return False, "Fail (prefix != 1.2.410.200123.100)"
+        level, series_num, unix_time, rand_num, instance_num = parts[5:10]
+        errors: list[str] = []
+        if level not in ["1", "2", "3"]:
+            errors.append(f"level {level}")
+        if series_num not in cls.SERIES_MAP:
+            errors.append(f"series number {series_num}")
+        if not (unix_time.isdigit() and int(unix_time) > 0):
+            errors.append(f"unix time {unix_time}")
+        if not (rand_num.isdigit() and 1 <= int(rand_num) <= 32767):
+            errors.append(f"rand {rand_num} not in 1~32767")
+        if not instance_num.isdigit():
+            errors.append(f"instance {instance_num}")
+        level_txt = {"1": "study", "2": "series", "3": "instance SOP"}.get(level, level)
+        series_txt = cls.SERIES_MAP.get(series_num, series_num)
+        if errors:
+            return False, f"Fail ({', '.join(errors)})"
+        return True, f"OK, {level_txt}, {series_txt}"
 
     @classmethod
     def evaluate_date(cls, value: str) -> tuple[bool, str]:
@@ -229,7 +283,7 @@ class TagStatusEvaluator:
             (ok, "OK"/"Fail") 튜플.
         """
         ok = is_valid_date(value)
-        return ok, "OK" if ok else "Fail"
+        return ok, "OK" if ok else "Fail (not YYYYMMDD)"
 
     @classmethod
     def evaluate_time(cls, value: str) -> tuple[bool, str]:
@@ -242,7 +296,7 @@ class TagStatusEvaluator:
             (ok, "OK"/"Fail") 튜플.
         """
         ok = is_valid_time(value)
-        return ok, "OK" if ok else "Fail"
+        return ok, "OK" if ok else "Fail (not HHMMSS[.FFFFFF])"
 
     @classmethod
     def evaluate_series_number(cls, value: str) -> tuple[bool, str]:
@@ -255,8 +309,10 @@ class TagStatusEvaluator:
             (ok, series_name) 튜플. 예시: (True, "GSPS") / (False, "Fail").
         """
         if not value:
-            return False, "Fail"
-        return value in cls.SERIES_MAP, cls.SERIES_MAP.get(value, "Fail")
+            return False, "Fail (empty)"
+        if value not in cls.SERIES_MAP:
+            return False, f"Fail (unknown series number {value})"
+        return True, cls.SERIES_MAP[value]
 
     @classmethod
     def evaluate_conversion_type(cls, value: str, series_num: str) -> tuple[bool, str]:
@@ -272,12 +328,14 @@ class TagStatusEvaluator:
         Returns:
             (ok, "OK"/"Fail") 튜플.
         """
-        if series_num in {"900010", "900070"}:
-            ok = value == "WSD"
-            return ok, "OK" if ok else 'Fail (No "WSD")'
-        else:
-            ok = value == ""
-            return ok, "OK (not SC or SC Report)" if ok else "Fail"
+        series_name = cls.SERIES_MAP.get(series_num, series_num or "unknown series")
+        if series_num in cls.CONVERSION_TYPE_SERIES:
+            if value == "WSD":
+                return True, "OK"
+            return False, 'Fail (expected "WSD")' if value else 'Fail (missing, "WSD" required)'
+        if value == "":
+            return True, "Skip (SC / SC Report only)"
+        return False, f"Fail (SC / SC Report only, found in {series_name})"
 
     @classmethod
     def evaluate_fixed_value(cls, value: str, expected: str) -> tuple[bool, str]:
@@ -291,7 +349,7 @@ class TagStatusEvaluator:
             (ok, "OK"/"Fail") 튜플.
         """
         ok = value == expected
-        return ok, "OK" if ok else "Fail"
+        return ok, "OK" if ok else f'Fail (expected "{expected}")'
 
     @classmethod
     def evaluate_model_name(cls, value: str) -> tuple[bool, str]:
@@ -304,8 +362,10 @@ class TagStatusEvaluator:
             (ok, display_name) 튜플. 정의되지 않은 값이면 원래 값을 그대로 반환.
         """
         if not value:
-            return False, "Fail"
-        return value in cls.MODEL_MAP, cls.MODEL_MAP.get(value, value)
+            return False, "Fail (empty)"
+        if value not in cls.MODEL_MAP:
+            return False, f"Fail (unknown model {value})"
+        return True, cls.MODEL_MAP[value]
 
     @classmethod
     def evaluate_version(cls, value: str) -> tuple[bool, str]:
@@ -318,32 +378,78 @@ class TagStatusEvaluator:
             (ok, "OK"/"Fail") 튜플.
         """
         if not value or not isinstance(value, str):
-            return False, "Fail"
+            return False, "Fail (empty)"
         ok = bool(re.search(r"\d+\.\d+\.\d+", value))
-        return ok, "OK" if ok else "Fail"
+        return ok, "OK" if ok else "Fail (no x.y.z version)"
 
     @classmethod
-    def evaluate_instance_number(cls, value: str | None) -> tuple[bool, str]:
-        """(0020,0013) Instance Number로 DICOM 종류와 SC Report 페이지를 판별한다.
+    def evaluate_instance_number(
+        cls, value: str | None, series_num: str = "", original_instance: str = ""
+    ) -> tuple[bool, str]:
+        """(0020,0013) Instance Number를 검증하고 DICOM 종류와 SC Report 페이지를 판별한다.
 
         규칙:
             SC:               원본 × 100   + 1     → 끝 2자리 "01"
-            SC Report:        원본 × 1000  + page  → 끝 3자리가 페이지 번호(1~N)
+            SC Report:        원본 × 1000  + page  → 끝 3자리가 페이지 번호(1~6)
             Encap.PDF Report: 원본 × 10000 + 1     → 끝 4자리 "0001"
             GSPS:             원본 × 100000 + 1    → 끝 5자리 "00001"
 
+        original_instance와 series_num이 모두 있으면 기대값을 계산해 정확히 대조하고,
+        없으면 끝자리 패턴으로 종류만 추정한다(unverified).
+
         Args:
             value: 검사할 Instance Number 값.
+            series_num: (0020,0011) Series Number 값. 없으면 빈 문자열.
+            original_instance: 원본 Instance Number. 원본에 없으면 "1". 원본 미로딩 시 빈 문자열.
 
         Returns:
-            (ok, dicom_type) 튜플. 예시: (True, "SC Report (2page)"), (True, "SC").
+            (ok, status) 튜플. 예시: (True, "OK, SC Report (2page)"), (True, "SC (unverified)").
         """
         if value is None:
-            return False, "Fail"
+            return False, "Fail (missing)"
         s = str(value).strip()
         if not s or not s.isdigit():
-            return False, "Fail"
+            return False, f"Fail (not a number: {s})" if s else "Fail (empty)"
 
+        if original_instance and series_num in cls.INSTANCE_RULES:
+            return cls._evaluate_instance_number_exact(int(s), series_num, original_instance)
+
+        # 원본 없음: Series Number를 알면 끝자리 offset만 검사, 모르면 패턴으로 종류 추정
+        if series_num in cls.INSTANCE_RULES:
+            mult, lo, hi = cls.INSTANCE_RULES[series_num]
+            name = cls.SERIES_MAP[series_num]
+            base, offset = divmod(int(s), mult)
+            if lo <= offset <= hi and base > 0:
+                page = f" ({offset}page)" if hi > 1 else ""
+                return True, f"{name}{page} (unverified, no original)"
+            rng = f"{lo}" if lo == hi else f"{lo}~{hi}"
+            return False, f"Fail (expected Nx{mult}+{rng} for {name}, got {s})"
+
+        ok, kind = cls._guess_instance_kind(s)
+        if not ok:
+            return False, f"Fail (no SC/SC Report/PDF/GSPS pattern: {s})"
+        return True, f"{kind} (unverified, no original)"
+
+    @classmethod
+    def _evaluate_instance_number_exact(
+        cls, number: int, series_num: str, original_instance: str
+    ) -> tuple[bool, str]:
+        """원본 Instance Number × multiplier + offset 규칙으로 정확히 대조한다."""
+        if not original_instance.isdigit():
+            return False, f"Fail (original instance not a number: {original_instance})"
+        base = int(original_instance)
+        mult, lo, hi = cls.INSTANCE_RULES[series_num]
+        name = cls.SERIES_MAP[series_num]
+        quotient, offset = divmod(number, mult)
+        if quotient == base and lo <= offset <= hi:
+            page = f" ({offset}page)" if hi > 1 else ""
+            return True, f"OK, {name}{page}"
+        rng = f"{lo}" if lo == hi else f"{lo}~{hi}"
+        return False, f"Fail (expected {base}x{mult}+{rng}, got {number})"
+
+    @classmethod
+    def _guess_instance_kind(cls, s: str) -> tuple[bool, str]:
+        """끝자리 패턴만으로 DICOM 종류를 추정한다."""
         if s.endswith("00001"):
             return True, "GSPS"
         if s.endswith("0001"):
@@ -363,7 +469,7 @@ class TagStatusEvaluator:
         if s.endswith("01"):
             return True, "SC"
 
-        return False, "Fail"
+        return False, ""
 
     @classmethod
     def evaluate_private_1009(cls, model: str, value: str) -> tuple[bool, str]:
@@ -378,16 +484,18 @@ class TagStatusEvaluator:
         Returns:
             (ok, "OK"/"Fail") 튜플.
         """
-        if not value or not model:
-            return False, "Fail"
-        model = str(model).strip().encode().decode(errors="ignore") if isinstance(model, bytes) else model.strip()
+        if not value:
+            return False, "Fail (empty)"
+        if not model:
+            return False, "Fail (no Manufacturer's Model Name to cross-check)"
+        model = model.strip()
         value = str(value).strip()
-        valid_models = {"VN-M-01", "VN-M-03", "VN-M-04", "VN-M-06", "VN-M-07", "VN-M-30", "VN-M-31"}
-        if model == "VN-M-02" and value == "3":
+        if model not in cls.MODEL_MAP:
+            return False, f"Fail (unknown model {model})"
+        expected = "3" if model == "VN-M-02" else "2"
+        if value == expected:
             return True, "OK"
-        elif model in valid_models and value == "2":
-            return True, "OK"
-        return False, "Fail"
+        return False, f'Fail (expected "{expected}" for {cls.MODEL_MAP[model]})'
 
     @classmethod
     def evaluate_private_json_prefix(cls, value: str, prefix_list: list[str]) -> tuple[bool, str]:
@@ -404,12 +512,52 @@ class TagStatusEvaluator:
             (ok, "OK"/"Fail") 튜플.
         """
         if not value or not isinstance(value, str):
-            return False, "Fail"
+            return False, "Fail (empty)"
         s = value.strip()
         # '{ "key"' 형태를 '{"key"'로 정규화하여 공백 차이를 허용
         s = re.sub(r'^\{\s*"', '{"', s)
         ok = any(s.startswith(p) for p in prefix_list)
-        return ok, "OK" if ok else "Fail"
+        return ok, "OK" if ok else f"Fail (must start with {prefix_list[0]})"
+
+    @classmethod
+    def evaluate_private_1005(cls, value: str) -> tuple[bool, str]:
+        """(1001,1005) CXR Link 플래그를 검증한다. 없으면 Skip, 있으면 "1"이어야 한다.
+
+        CXR Link 결과인지 판별할 정보가 없어 부재 시 Skip 처리한다.
+
+        Args:
+            value: 검사할 값. 태그 부재 시 빈 문자열.
+
+        Returns:
+            (ok, status) 튜플.
+        """
+        if not value:
+            return True, "Skip (CXR Link only)"
+        return (True, "OK") if value == "1" else (False, 'Fail (expected "1")')
+
+    @classmethod
+    def evaluate_private_1011(cls, value: str, model: str, series_num: str) -> tuple[bool, str]:
+        """(1001,1011) 값을 검증한다. CXR 제품군의 SC·GSPS에만 존재해야 한다.
+
+        Args:
+            value: 검사할 값. 태그 부재 시 빈 문자열.
+            model: (0008,1090) Manufacturer's Model Name 값.
+            series_num: (0020,0011) Series Number 값.
+
+        Returns:
+            (ok, status) 튜플.
+        """
+        applicable = model in cls.CXR_FAMILY and series_num in cls.PRIVATE_1011_SERIES
+        if not applicable:
+            if value:
+                where = f"{cls.MODEL_MAP.get(model, model or 'unknown model')} {cls.SERIES_MAP.get(series_num, series_num)}"
+                return False, f"Fail (CXR SC/GSPS only, found in {where})"
+            return True, "Skip (CXR SC/GSPS only)"
+        if not value:
+            if model in cls.PRIVATE_1011_REQUIRED:
+                return False, "Fail (missing)"
+            return True, f"Skip (optional for {cls.MODEL_MAP[model]})"
+        return cls.evaluate_private_json_prefix(value, ['{"result":', '{"result" :'])
 
     @classmethod
     def evaluate_json(cls, value: str, model: str) -> tuple[bool, str]:
@@ -425,14 +573,14 @@ class TagStatusEvaluator:
             (ok, "OK"/"Fail") 튜플.
         """
         if model == "VN-M-31" and not value:
-            return True, "OK"
+            return True, "Skip (empty allowed for CXR Assist)"
         if not value or not isinstance(value, str):
-            return False, "Fail"
+            return False, "Fail (empty)"
         try:
             json.loads(value)
             return True, "OK"
-        except json.JSONDecodeError:
-            return False, "Fail"
+        except json.JSONDecodeError as e:
+            return False, f"Fail (invalid JSON: {e.msg} at {e.pos})"
 
     @classmethod
     def evaluate_study_description(cls, value: str) -> tuple[bool, str]:
@@ -458,7 +606,7 @@ class TagStatusEvaluator:
         """
         if value in ["VUNO Med Analysis Result", "VUNO MED Analysis Result"]:
             return True, "OK"
-        return False, "Fail"
+        return False, 'Fail (expected "VUNO Med Analysis Result")'
 
     @classmethod
     def evaluate_same_as_original(
@@ -682,6 +830,17 @@ class TagCheckerApp(QMainWindow):
 
         model = str(ds[Tag(0x0008, 0x1090)].value).strip() if (0x0008, 0x1090) in ds else ""
         series_num_str = str(ds[Tag(0x0020, 0x0011)].value).strip() if (0x0020, 0x0011) in ds else ""
+        original_series_uid = (
+            str(original_ds[Tag(0x0020, 0x000E)].value).strip()
+            if original_ds is not None and (0x0020, 0x000E) in original_ds else ""
+        )
+        # 원본에 Instance Number가 없으면 스펙상 1로 간주. 원본 미로딩 시 빈 문자열.
+        original_instance = ""
+        if original_ds is not None:
+            original_instance = (
+                str(original_ds[Tag(0x0020, 0x0013)].value).strip()
+                if (0x0020, 0x0013) in original_ds else ""
+            ) or "1"
 
         conv_tag = Tag(0x0008, 0x0064)
         conv_val = str(ds[conv_tag].value).strip() if conv_tag in ds else ""
@@ -696,11 +855,12 @@ class TagCheckerApp(QMainWindow):
                 val = str(ds[tag].value).strip() if tag in ds else ""
                 ok, status = TagStatusEvaluator.evaluate_same_as_original(val, original_ds, tag)
                 add(tag, desc, val, ok, status)
-            except Exception:
-                add(tag, desc, "ERROR", False, "Fail")
+            except Exception as e:
+                add(tag, desc, "ERROR", False, f"Fail (read error: {e})")
 
         tag_map = [
-            (Tag(0x0020, 0x000E), "Series Instance UID", TagStatusEvaluator.evaluate_series_uid),
+            (Tag(0x0020, 0x000E), "Series Instance UID",
+             lambda v: TagStatusEvaluator.evaluate_series_uid(v, original_series_uid)),
             (Tag(0x0008, 0x0021), "Series Date", TagStatusEvaluator.evaluate_date),
             (Tag(0x0020, 0x0011), "Series Number", TagStatusEvaluator.evaluate_series_number),
             (Tag(0x0008, 0x0070), "Manufacturer", lambda v: TagStatusEvaluator.evaluate_fixed_value(v, "VUNO")),
@@ -709,21 +869,26 @@ class TagCheckerApp(QMainWindow):
             (Tag(0x0008, 0x0012), "Instance Creation Date", TagStatusEvaluator.evaluate_date),
             (Tag(0x0008, 0x0013), "Instance Creation Time", TagStatusEvaluator.evaluate_time),
             (Tag(0x0008, 0x0018), "SOP Instance UID", TagStatusEvaluator.evaluate_sop_instance_uid),
-            (Tag(0x0020, 0x0013), "Instance Number", TagStatusEvaluator.evaluate_instance_number),
-            (Tag(0x0020, 0x4000), "Image Comments", lambda v: (bool(v), "OK" if v else "Fail")),
+            (Tag(0x0020, 0x0013), "Instance Number",
+             lambda v: TagStatusEvaluator.evaluate_instance_number(v, series_num_str, original_instance)),
+            (Tag(0x0020, 0x4000), "Image Comments", lambda v: (bool(v), "OK" if v else "Fail (empty)")),
             (Tag(0x0008, 0x1030), "Study Description", TagStatusEvaluator.evaluate_study_description),
             (Tag(0x0008, 0x103E), "Series Description", TagStatusEvaluator.evaluate_series_description),
         ]
 
         private_tag_map = [
             (Tag(0x1001, 0x1002), "Private Version", TagStatusEvaluator.evaluate_version),
-            (Tag(0x1001, 0x1004), "Private Flag 0/1", lambda v: (v in ["0", "1"], "OK" if v in ["0", "1"] else "Fail")),
-            (Tag(0x1001, 0x1005), "Private Flag 1", lambda v: (v == "1", "OK" if v == "1" else "Fail")),
+            (Tag(0x1001, 0x1004), "Private Flag 0/1",
+             lambda v: (v in ["0", "1"], "OK" if v in ["0", "1"] else 'Fail (expected "0" or "1")')),
+            (Tag(0x1001, 0x1005), "Private Flag 1", TagStatusEvaluator.evaluate_private_1005),
             (Tag(0x1001, 0x1008), "Private Report", lambda v: TagStatusEvaluator.evaluate_private_json_prefix(v, ['{"report": "', '{"report":"'])),
             (Tag(0x1001, 0x1009), "Private Type", lambda v: TagStatusEvaluator.evaluate_private_1009(model, v)),
-            (Tag(0x1001, 0x1011), "Private Report/RADS", lambda v: TagStatusEvaluator.evaluate_private_json_prefix(v, ['{"result":', '{"result" :'])),
+            (Tag(0x1001, 0x1011), "Private Report/RADS",
+             lambda v: TagStatusEvaluator.evaluate_private_1011(v, model, series_num_str)),
             (Tag(0x1001, 0x1015), "Private JSON", lambda v: TagStatusEvaluator.evaluate_json(v, model)),
         ]
+        # 부재 자체가 의미를 갖는 태그: 빈 값으로 평가 함수를 호출해 Skip/Fail을 판정
+        evaluate_when_absent = {Tag(0x1001, 0x1005), Tag(0x1001, 0x1011), Tag(0x1001, 0x1015)}
 
         for tag, desc, fn in tag_map:
             try:
@@ -733,9 +898,9 @@ class TagCheckerApp(QMainWindow):
                     ok, status = fn(val)
                     add(tag, desc, val, ok, status)
                 else:
-                    add(tag, desc, "", False, "Fail")
-            except Exception:
-                add(tag, desc, "ERROR", False, "Fail")
+                    add(tag, desc, "", False, "Fail (missing)")
+            except Exception as e:
+                add(tag, desc, "ERROR", False, f"Fail (read error: {e})")
 
         for tag, desc, fn in private_tag_map:
             try:
@@ -751,10 +916,13 @@ class TagCheckerApp(QMainWindow):
                         val = str(value) if not isinstance(value, bytes) else value.decode(errors="ignore")
                         ok, status = fn(val)
                         add(tag, desc, val, ok, status)
+                elif tag in evaluate_when_absent:
+                    ok, status = fn("")
+                    add(tag, desc, "", ok, status)
                 else:
-                    add(tag, desc, "", False, "Fail")
-            except Exception:
-                add(tag, desc, "ERROR", False, "Fail")
+                    add(tag, desc, "", False, "Fail (missing)")
+            except Exception as e:
+                add(tag, desc, "ERROR", False, f"Fail (read error: {e})")
 
         return tags
 
