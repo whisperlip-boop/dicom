@@ -5,7 +5,7 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 
 from PyQt5.QtWidgets import *
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QPoint
 from PyQt5.QtGui import QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -75,8 +75,8 @@ class DicomLength(QMainWindow):
         self.dicom_file = None
         self.ds = None
         self.pixel_array = None
-        self.pixel_spacing = None
-        self.pixel_spacing_source = None
+        self.pixel_spacing: float | None = None
+        self.pixel_spacing_source: str | None = None
         self.rows = self.columns = 0
         self.ps_estimated = 0.0
 
@@ -90,7 +90,7 @@ class DicomLength(QMainWindow):
         self.center_x = 0
         self.center_y = 0
         self.dragging_mid = False
-        self.drag_start = None
+        self.drag_start: QPoint | None = None
 
         # Window Level
         self.window_center = 127
@@ -334,7 +334,7 @@ class DicomLength(QMainWindow):
             self.right_click_start = e.pos()
             self.display_image()
 
-        if e.buttons() & Qt.MidButton and self.dragging_mid:
+        if e.buttons() & Qt.MidButton and self.dragging_mid and self.drag_start is not None:
             delta = e.pos() - self.drag_start
             scale = 1.0 / self.zoom_factor
             self.center_x -= delta.x() * scale
@@ -378,7 +378,21 @@ class DicomLength(QMainWindow):
         return data_x, data_y
 
     # ------------------- 거리 계산 -------------------
-    def calculate_distance(self, pt1, pt2):
+    def calculate_distance(self, pt1: tuple[float, float], pt2: tuple[float, float]) -> float:
+        """Calculate the real-world distance between two image points.
+
+        Args:
+            pt1: First point in image (pixel) coordinates.
+            pt2: Second point in image (pixel) coordinates.
+
+        Returns:
+            Distance in millimeters.
+
+        Raises:
+            RuntimeError: If called before a DICOM file has been loaded.
+        """
+        if self.pixel_spacing is None:
+            raise RuntimeError("calculate_distance() called before a DICOM file was loaded.")
         dx, dy = pt2[0] - pt1[0], pt2[1] - pt1[1]
         return math.hypot(dx, dy) * self.pixel_spacing
 

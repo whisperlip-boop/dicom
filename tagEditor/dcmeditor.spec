@@ -2,9 +2,9 @@
 import sys
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
- 
+
 block_cipher = None
- 
+
 # Collect all data files needed by pydicom, gdcm, and pylibjpeg
 datas = collect_data_files('pydicom')
 datas += collect_data_files('gdcm')
@@ -12,8 +12,8 @@ datas += collect_data_files('pylibjpeg')
 datas += collect_data_files('pylibjpeg-libjpeg')
 datas += collect_data_files('pylibjpeg-openjpeg')
 datas += [('editor.ico', '.')]
- 
-a = Analysis(['dcmeditor.py'],
+
+a = Analysis(['app.py'],
              pathex=[],
              binaries=[],
              datas=datas,
@@ -28,9 +28,9 @@ a = Analysis(['dcmeditor.py'],
              win_private_assemblies=False,
              cipher=block_cipher,
              noarchive=False)
- 
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
- 
+
 exe = EXE(pyz,
           a.scripts,
           a.binaries,
