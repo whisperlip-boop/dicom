@@ -5,3 +5,4 @@ dist/
 *.pkg
 *.pyc
 __pycache__/
+*.log
